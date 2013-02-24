@@ -2,17 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// HTTP server.  See RFC 2616.
+// RTSP server.  See RFC 2326.
 
 // TODO(rsc):
 //	logging
 
-package http
+package rtsp
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -28,54 +27,52 @@ import (
 	"time"
 )
 
-// Errors introduced by the HTTP server.
+// Errors introduced by the RTSP server.
 var (
 	ErrWriteAfterFlush = errors.New("Conn.Write called after Flush")
-	ErrBodyNotAllowed  = errors.New("http: request method or response status code does not allow body")
+	ErrBodyNotAllowed  = errors.New("rtsp: request method or response status code does not allow body")
 	ErrHijacked        = errors.New("Conn has been hijacked")
 	ErrContentLength   = errors.New("Conn.Write wrote more than the declared Content-Length")
 )
 
 // Objects implementing the Handler interface can be
 // registered to serve a particular path or subtree
-// in the HTTP server.
+// in the RTSP server.
 //
-// ServeHTTP should write reply headers and data to the ResponseWriter
+// ServeRTSP should write reply headers and data to the ResponseWriter
 // and then return.  Returning signals that the request is finished
-// and that the HTTP server can move on to the next request on
+// and that the RTSP server can move on to the next request on
 // the connection.
 type Handler interface {
-	ServeHTTP(ResponseWriter, *Request)
+	ServeRTSP(ResponseWriter, *Request)
 }
 
-// A ResponseWriter interface is used by an HTTP handler to
-// construct an HTTP response.
+// A ResponseWriter interface is used by an RTSP handler to
+// construct an RTSP response.
 type ResponseWriter interface {
 	// Header returns the header map that will be sent by WriteHeader.
 	// Changing the header after a call to WriteHeader (or Write) has
 	// no effect.
 	Header() Header
 
-	// Write writes the data to the connection as part of an HTTP reply.
-	// If WriteHeader has not yet been called, Write calls WriteHeader(http.StatusOK)
-	// before writing the data.  If the Header does not contain a
-	// Content-Type line, Write adds a Content-Type set to the result of passing
-	// the initial 512 bytes of written data to DetectContentType.
+	// Write writes the data to the connection as part of an RTSP reply.
+	// If WriteHeader has not yet been called, Write calls WriteHeader(rtsp.StatusOK)
+	// before writing the data.  
 	Write([]byte) (int, error)
 
-	// WriteHeader sends an HTTP response header with status code.
+	// WriteHeader sends an RTSP response header with status code.
 	// If WriteHeader is not called explicitly, the first call to Write
-	// will trigger an implicit WriteHeader(http.StatusOK).
+	// will trigger an implicit WriteHeader(rtsp.StatusOK).
 	// Thus explicit calls to WriteHeader are mainly used to
 	// send error codes.
 	WriteHeader(int)
 }
 
 // The Flusher interface is implemented by ResponseWriters that allow
-// an HTTP handler to flush buffered data to the client.
+// an RTSP handler to flush buffered data to the client.
 //
 // Note that even for ResponseWriters that support Flush,
-// if the client is connected through an HTTP proxy,
+// if the client is connected through an RTSP proxy,
 // the buffered data may not reach the client until the response
 // completes.
 type Flusher interface {
@@ -84,17 +81,17 @@ type Flusher interface {
 }
 
 // The Hijacker interface is implemented by ResponseWriters that allow
-// an HTTP handler to take over the connection.
+// an RTSP handler to take over the connection.
 type Hijacker interface {
 	// Hijack lets the caller take over the connection.
-	// After a call to Hijack(), the HTTP server library
+	// After a call to Hijack(), the RTSP server library
 	// will not do anything else with the connection.
 	// It becomes the caller's responsibility to manage
 	// and close the connection.
 	Hijack() (net.Conn, *bufio.ReadWriter, error)
 }
 
-// A conn represents the server side of an HTTP connection.
+// A conn represents the server side of an RTSP connection.
 type conn struct {
 	remoteAddr string               // network address of remote side
 	server     *Server              // the Server on which the connection arrived
@@ -102,11 +99,10 @@ type conn struct {
 	lr         *io.LimitedReader    // io.LimitReader(rwc)
 	buf        *bufio.ReadWriter    // buffered(lr,rwc), reading from bufio->limitReader->rwc
 	hijacked   bool                 // connection has been hijacked by handler
-	tlsState   *tls.ConnectionState // or nil when not using TLS
 	body       []byte
 }
 
-// A response represents the server side of an HTTP response.
+// A response represents the server side of an RTSP response.
 type response struct {
 	conn          *conn
 	req           *Request // request for this response
@@ -123,12 +119,12 @@ type response struct {
 	// updated after response from handler if there's a
 	// "Connection: keep-alive" response header and a
 	// Content-Length.
-	closeAfterReply bool
+	closeAfterReply bool //will not close after reply
 
 	// requestBodyLimitHit is set by requestTooLarge when
 	// maxBytesReader hits its max size. It is checked in
 	// WriteHeader, to make sure we don't consume the the
-	// remaining request body to try to advance to the next HTTP
+	// remaining request body to try to advance to the next RTSP 
 	// request. Instead, when this is set, we stop doing
 	// subsequent requests on this connection and stop reading
 	// input from it.
@@ -198,7 +194,7 @@ func (srv *Server) maxHeaderBytes() int {
 }
 
 // wrapper around io.ReaderCloser which on first read, sends an
-// HTTP/1.1 100 Continue header
+// HTTP/1.0 100 RTSP header
 type expectContinueReader struct {
 	resp       *response
 	readCloser io.ReadCloser
@@ -207,11 +203,11 @@ type expectContinueReader struct {
 
 func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 	if ecr.closed {
-		return 0, errors.New("http: Read after Close on request Body")
+		return 0, errors.New("rtsp: Read after Close on request Body")
 	}
 	if !ecr.resp.wroteContinue && !ecr.resp.conn.hijacked {
 		ecr.resp.wroteContinue = true
-		io.WriteString(ecr.resp.conn.buf, "HTTP/1.1 100 Continue\r\n\r\n")
+		io.WriteString(ecr.resp.conn.buf, "RTSP/1.0 100 Continue\r\n\r\n")
 		ecr.resp.conn.buf.Flush()
 	}
 	return ecr.readCloser.Read(p)
@@ -228,7 +224,7 @@ func (ecr *expectContinueReader) Close() error {
 // It is like time.RFC1123 but hard codes GMT as the time zone.
 const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 
-var errTooLarge = errors.New("http: request too large")
+var errTooLarge = errors.New("rtsp: request too large")
 
 // Read next request from connection.
 func (c *conn) readRequest() (w *response, err error) {
@@ -274,11 +270,11 @@ const maxPostHandlerReadBytes = 256 << 10
 
 func (w *response) WriteHeader(code int) {
 	if w.conn.hijacked {
-		log.Print("http: response.WriteHeader on hijacked connection")
+		log.Print("rtsp: response.WriteHeader on hijacked connection")
 		return
 	}
 	if w.wroteHeader {
-		log.Print("http: multiple response.WriteHeader calls")
+		log.Print("rtsp: multiple response.WriteHeader calls")
 		return
 	}
 	w.wroteHeader = true
@@ -293,11 +289,13 @@ func (w *response) WriteHeader(code int) {
 		if err == nil {
 			hasCL = true
 		} else {
-			log.Printf("http: invalid Content-Length of %q sent", clenStr)
+			log.Printf("rtsp: invalid Content-Length of %q sent", clenStr)
 			w.header.Del("Content-Length")
 		}
 	}
 
+	//TODO how to close connection???
+	/*
 	if w.req.wantsHttp10KeepAlive() && (w.req.Method == "HEAD" || hasCL) {
 		_, connectionHeaderSet := w.header["Connection"]
 		if !connectionHeaderSet {
@@ -311,93 +309,11 @@ func (w *response) WriteHeader(code int) {
 	if w.header.Get("Connection") == "close" {
 		w.closeAfterReply = true
 	}
+	*/
 
-	// Per RFC 2616, we should consume the request body before
-	// replying, if the handler hasn't already done so.  But we
-	// don't want to do an unbounded amount of reading here for
-	// DoS reasons, so we only try up to a threshold.
-	if w.req.ContentLength != 0 && !w.closeAfterReply {
-		ecr, isExpecter := w.req.Body.(*expectContinueReader)
-		if !isExpecter || ecr.resp.wroteContinue {
-			n, _ := io.CopyN(ioutil.Discard, w.req.Body, maxPostHandlerReadBytes+1)
-			if n >= maxPostHandlerReadBytes {
-				w.requestTooLarge()
-				w.header.Set("Connection", "close")
-			} else {
-				w.req.Body.Close()
-			}
-		}
-	}
-
-	if code == StatusNotModified {
-		// Must not have body.
-		for _, header := range []string{"Content-Type", "Content-Length", "Transfer-Encoding"} {
-			if w.header.Get(header) != "" {
-				// TODO: return an error if WriteHeader gets a return parameter
-				// or set a flag on w to make future Writes() write an error page?
-				// for now just log and drop the header.
-				log.Printf("http: StatusNotModified response with header %q defined", header)
-				w.header.Del(header)
-			}
-		}
-	} else {
-		// If no content type, apply sniffing algorithm to body.
-		if w.header.Get("Content-Type") == "" && w.req.Method != "HEAD" {
-			w.needSniff = true
-		}
-	}
-
-	if _, ok := w.header["Date"]; !ok {
-		w.Header().Set("Date", time.Now().UTC().Format(TimeFormat))
-	}
-
-	te := w.header.Get("Transfer-Encoding")
-	hasTE := te != ""
-	if hasCL && hasTE && te != "identity" {
-		// TODO: return an error if WriteHeader gets a return parameter
-		// For now just ignore the Content-Length.
-		log.Printf("http: WriteHeader called with both Transfer-Encoding of %q and a Content-Length of %d",
-			te, contentLength)
-		w.header.Del("Content-Length")
-		hasCL = false
-	}
-
-	if w.req.Method == "HEAD" || code == StatusNotModified {
-		// do nothing
-	} else if hasCL {
-		w.contentLength = contentLength
-		w.header.Del("Transfer-Encoding")
-	} else if w.req.ProtoAtLeast(1, 1) {
-		// HTTP/1.1 or greater: use chunked transfer encoding
-		// to avoid closing the connection at EOF.
-		// TODO: this blows away any custom or stacked Transfer-Encoding they
-		// might have set.  Deal with that as need arises once we have a valid
-		// use case.
-		w.chunking = true
-		w.header.Set("Transfer-Encoding", "chunked")
-	} else {
-		// HTTP version < 1.1: cannot do chunked transfer
-		// encoding and we don't know the Content-Length so
-		// signal EOF by closing connection.
-		w.closeAfterReply = true
-		w.header.Del("Transfer-Encoding") // in case already set
-	}
-
-	// Cannot use Content-Length with non-identity Transfer-Encoding.
-	if w.chunking {
-		w.header.Del("Content-Length")
-	}
-	if !w.req.ProtoAtLeast(1, 0) {
-		return
-	}
-
-	if w.closeAfterReply && !hasToken(w.header.Get("Connection"), "close") {
-		w.header.Set("Connection", "close")
-	}
-
-	proto := "HTTP/1.0"
+	proto := "RTSP/1.0"
 	if w.req.ProtoAtLeast(1, 1) {
-		proto = "HTTP/1.1"
+		proto = "RTSP/1.1"
 	}
 	codestring := strconv.Itoa(code)
 	text, ok := statusText[code]
@@ -416,7 +332,7 @@ func (w *response) WriteHeader(code int) {
 
 // sniff uses the first block of written data,
 // stored in w.conn.body, to decide the Content-Type
-// for the HTTP body.
+// for the RTSP body.
 func (w *response) sniff() {
 	if !w.needSniff {
 		return
@@ -585,7 +501,7 @@ func (c *conn) serve() {
 		}
 
 		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "http: panic serving %v: %v\n", c.remoteAddr, err)
+		fmt.Fprintf(&buf, "rtsp: panic serving %v: %v\n", c.remoteAddr, err)
 		buf.Write(debug.Stack())
 		log.Print(buf.String())
 
@@ -594,21 +510,12 @@ func (c *conn) serve() {
 		}
 	}()
 
-	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
-		if err := tlsConn.Handshake(); err != nil {
-			c.close()
-			return
-		}
-		c.tlsState = new(tls.ConnectionState)
-		*c.tlsState = tlsConn.ConnectionState()
-	}
-
 	for {
 		w, err := c.readRequest()
 		if err != nil {
 			msg := "400 Bad Request"
 			if err == errTooLarge {
-				// Their HTTP client may or may not be
+				// Their RTSP client may or may not be
 				// able to read this if we're
 				// responding to them and hanging up
 				// while they're still writing their
@@ -619,40 +526,7 @@ func (c *conn) serve() {
 			} else if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 				break // Don't reply
 			}
-			fmt.Fprintf(c.rwc, "HTTP/1.1 %s\r\n\r\n", msg)
-			break
-		}
-
-		// Expect 100 Continue support
-		req := w.req
-		if req.expectsContinue() {
-			if req.ProtoAtLeast(1, 1) {
-				// Wrap the Body reader with one that replies on the connection
-				req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
-			}
-			if req.ContentLength == 0 {
-				w.Header().Set("Connection", "close")
-				w.WriteHeader(StatusBadRequest)
-				w.finishRequest()
-				break
-			}
-			req.Header.Del("Expect")
-		} else if req.Header.Get("Expect") != "" {
-			// TODO(bradfitz): let ServeHTTP handlers handle
-			// requests with non-standard expectation[s]? Seems
-			// theoretical at best, and doesn't fit into the
-			// current ServeHTTP model anyway.  We'd need to
-			// make the ResponseWriter an optional
-			// "ExpectReplier" interface or something.
-			//
-			// For now we'll just obey RFC 2616 14.20 which says
-			// "If a server receives a request containing an
-			// Expect field that includes an expectation-
-			// extension that it does not support, it MUST
-			// respond with a 417 (Expectation Failed) status."
-			w.Header().Set("Connection", "close")
-			w.WriteHeader(StatusExpectationFailed)
-			w.finishRequest()
+			fmt.Fprintf(c.rwc, "RTSP/1.1 %s\r\n\r\n", msg)
 			break
 		}
 
@@ -661,16 +535,17 @@ func (c *conn) serve() {
 			handler = DefaultServeMux
 		}
 
-		// HTTP cannot have multiple simultaneous active requests.[*]
+		// RTSP cannot have multiple simultaneous active requests.[*]
 		// Until the server replies to this request, it can't read another,
 		// so we might as well run the handler in this goroutine.
-		// [*] Not strictly true: HTTP pipelining.  We could let them all process
+		// [*] Not strictly true: RTSP pipelining.  We could let them all process
 		// in parallel even if their responses need to be serialized.
-		handler.ServeHTTP(w, w.req)
+		handler.ServeRTSP(w, w.req)
 		if c.hijacked {
 			return
 		}
 		w.finishRequest()
+		// TODO when close???
 		if w.closeAfterReply {
 			break
 		}
@@ -698,8 +573,8 @@ func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 // Handler object that calls f.
 type HandlerFunc func(ResponseWriter, *Request)
 
-// ServeHTTP calls f(w, r).
-func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+// ServeRTSP calls f(w, r).
+func (f HandlerFunc) ServeRTSP(w ResponseWriter, r *Request) {
 	f(w, r)
 }
 
@@ -712,87 +587,12 @@ func Error(w ResponseWriter, error string, code int) {
 	fmt.Fprintln(w, error)
 }
 
-// NotFound replies to the request with an HTTP 404 not found error.
+// NotFound replies to the request with an RTSP 404 not found error.
 func NotFound(w ResponseWriter, r *Request) { Error(w, "404 page not found", StatusNotFound) }
 
 // NotFoundHandler returns a simple request handler
 // that replies to each request with a ``404 page not found'' reply.
 func NotFoundHandler() Handler { return HandlerFunc(NotFound) }
-
-// StripPrefix returns a handler that serves HTTP requests
-// by removing the given prefix from the request URL's Path
-// and invoking the handler h. StripPrefix handles a
-// request for a path that doesn't begin with prefix by
-// replying with an HTTP 404 not found error.
-func StripPrefix(prefix string, h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, r *Request) {
-		if !strings.HasPrefix(r.URL.Path, prefix) {
-			NotFound(w, r)
-			return
-		}
-		r.URL.Path = r.URL.Path[len(prefix):]
-		h.ServeHTTP(w, r)
-	})
-}
-
-// Redirect replies to the request with a redirect to url,
-// which may be a path relative to the request path.
-func Redirect(w ResponseWriter, r *Request, urlStr string, code int) {
-	if u, err := url.Parse(urlStr); err == nil {
-		// If url was relative, make absolute by
-		// combining with request path.
-		// The browser would probably do this for us,
-		// but doing it ourselves is more reliable.
-
-		// NOTE(rsc): RFC 2616 says that the Location
-		// line must be an absolute URI, like
-		// "http://www.google.com/redirect/",
-		// not a path like "/redirect/".
-		// Unfortunately, we don't know what to
-		// put in the host name section to get the
-		// client to connect to us again, so we can't
-		// know the right absolute URI to send back.
-		// Because of this problem, no one pays attention
-		// to the RFC; they all send back just a new path.
-		// So do we.
-		oldpath := r.URL.Path
-		if oldpath == "" { // should not happen, but avoid a crash if it does
-			oldpath = "/"
-		}
-		if u.Scheme == "" {
-			// no leading http://server
-			if urlStr == "" || urlStr[0] != '/' {
-				// make relative path absolute
-				olddir, _ := path.Split(oldpath)
-				urlStr = olddir + urlStr
-			}
-
-			var query string
-			if i := strings.Index(urlStr, "?"); i != -1 {
-				urlStr, query = urlStr[:i], urlStr[i:]
-			}
-
-			// clean up but preserve trailing slash
-			trailing := urlStr[len(urlStr)-1] == '/'
-			urlStr = path.Clean(urlStr)
-			if trailing && urlStr[len(urlStr)-1] != '/' {
-				urlStr += "/"
-			}
-			urlStr += query
-		}
-	}
-
-	w.Header().Set("Location", urlStr)
-	w.WriteHeader(code)
-
-	// RFC2616 recommends that a short note "SHOULD" be included in the
-	// response because older user agents may not understand 301/307.
-	// Shouldn't send the response for POST or HEAD; that leaves GET.
-	if r.Method == "GET" {
-		note := "<a href=\"" + htmlEscape(urlStr) + "\">" + statusText[code] + "</a>.\n"
-		fmt.Fprintln(w, note)
-	}
-}
 
 var htmlReplacer = strings.NewReplacer(
 	"&", "&amp;",
@@ -808,46 +608,10 @@ func htmlEscape(s string) string {
 	return htmlReplacer.Replace(s)
 }
 
-// Redirect to a fixed URL
-type redirectHandler struct {
-	url  string
-	code int
-}
-
-func (rh *redirectHandler) ServeHTTP(w ResponseWriter, r *Request) {
-	Redirect(w, r, rh.url, rh.code)
-}
-
-// RedirectHandler returns a request handler that redirects
-// each request it receives to the given url using the given
-// status code.
-func RedirectHandler(url string, code int) Handler {
-	return &redirectHandler{url, code}
-}
-
-// ServeMux is an HTTP request multiplexer.
-// It matches the URL of each incoming request against a list of registered
-// patterns and calls the handler for the pattern that
-// most closely matches the URL.
-//
-// Patterns name fixed, rooted paths, like "/favicon.ico",
-// or rooted subtrees, like "/images/" (note the trailing slash).
-// Longer patterns take precedence over shorter ones, so that
-// if there are handlers registered for both "/images/"
-// and "/images/thumbnails/", the latter handler will be
-// called for paths beginning "/images/thumbnails/" and the
-// former will receive requests for any other paths in the
-// "/images/" subtree.
-//
-// Patterns may optionally begin with a host name, restricting matches to
-// URLs on that host only.  Host-specific patterns take precedence over
-// general patterns, so that a handler might register for the two patterns
-// "/codesearch" and "codesearch.google.com/" without also taking over
-// requests for "http://www.google.com/".
-//
-// ServeMux also takes care of sanitizing the URL request path,
-// redirecting any request containing . or .. elements to an
-// equivalent .- and ..-free URL.
+// ServeMux is an RTSP request multiplexer.
+// It matches the method of each incoming request against a list of registered
+// method and calls the handler for the method that
+// matches the method.
 type ServeMux struct {
 	mu sync.RWMutex
 	m  map[string]muxEntry
@@ -863,6 +627,9 @@ func NewServeMux() *ServeMux { return &ServeMux{m: make(map[string]muxEntry)} }
 
 // DefaultServeMux is the default ServeMux used by Serve.
 var DefaultServeMux = NewServeMux()
+
+func methodMatch(method) bool {
+}
 
 // Does path match pattern?
 func pathMatch(pattern, path string) bool {
@@ -894,19 +661,11 @@ func cleanPath(p string) string {
 	return np
 }
 
-// Find a handler on a handler map given a path string
-// Most-specific (longest) pattern wins
-func (mux *ServeMux) match(path string) Handler {
+// Find a handler on a handler map given a method string
+func (mux *ServeMux) match(method string) Handler {
 	var h Handler
-	var n = 0
-	for k, v := range mux.m {
-		if !pathMatch(k, path) {
-			continue
-		}
-		if h == nil || len(k) > n {
-			n = len(k)
-			h = v.h
-		}
+	if v, ok := mux.m[method], ok {
+		h = v.h	
 	}
 	return h
 }
@@ -916,76 +675,55 @@ func (mux *ServeMux) handler(r *Request) Handler {
 	mux.mu.RLock()
 	defer mux.mu.RUnlock()
 
-	// Host-specific pattern takes precedence over generic ones
-	h := mux.match(r.Host + r.URL.Path)
-	if h == nil {
-		h = mux.match(r.URL.Path)
-	}
+	// Host-specific method takes precedence over generic ones
+	h := mux.match(r.Method)
 	if h == nil {
 		h = NotFoundHandler()
 	}
 	return h
 }
 
-// ServeHTTP dispatches the request to the handler whose
-// pattern most closely matches the request URL.
-func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
-	if r.Method != "CONNECT" {
-		// Clean path to canonical form and redirect.
-		if p := cleanPath(r.URL.Path); p != r.URL.Path {
-			w.Header().Set("Location", p)
-			w.WriteHeader(StatusMovedPermanently)
-			return
-		}
-	}
-	mux.handler(r).ServeHTTP(w, r)
+// ServeRTSP dispatches the request to the handler whose
+// method same as the request method.
+func (mux *ServeMux) ServeRTSP(w ResponseWriter, r *Request) {
+	mux.handler(r).ServeRTSP(w, r)
 }
 
-// Handle registers the handler for the given pattern.
-// If a handler already exists for pattern, Handle panics.
-func (mux *ServeMux) Handle(pattern string, handler Handler) {
+// Handle registers the handler for the given method.
+// If a handler already exists for method, Handle panics.
+func (mux *ServeMux) Handle(method string, handler Handler) {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 
 	if pattern == "" {
-		panic("http: invalid pattern " + pattern)
+		panic("rtsp: invalid method " + method)
 	}
 	if handler == nil {
-		panic("http: nil handler")
+		panic("method: nil handler")
 	}
-	if mux.m[pattern].explicit {
-		panic("http: multiple registrations for " + pattern)
+	if mux.m[method].explicit {
+		panic("rtsp: multiple registrations for " + method)
 	}
 
-	mux.m[pattern] = muxEntry{explicit: true, h: handler}
-
-	// Helpful behavior:
-	// If pattern is /tree/, insert an implicit permanent redirect for /tree.
-	// It can be overridden by an explicit registration.
-	n := len(pattern)
-	if n > 0 && pattern[n-1] == '/' && !mux.m[pattern[0:n-1]].explicit {
-		mux.m[pattern[0:n-1]] = muxEntry{h: RedirectHandler(pattern, StatusMovedPermanently)}
-	}
+	mux.m[method] = muxEntry{explicit: true, h: handler}
 }
 
-// HandleFunc registers the handler function for the given pattern.
-func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
-	mux.Handle(pattern, HandlerFunc(handler))
+// HandleFunc registers the handler function for the given method.
+func (mux *ServeMux) HandleFunc(method string, handler func(ResponseWriter, *Request)) {
+	mux.Handle(method, HandlerFunc(handler))
 }
 
-// Handle registers the handler for the given pattern
+// Handle registers the handler for the given method 
 // in the DefaultServeMux.
-// The documentation for ServeMux explains how patterns are matched.
-func Handle(pattern string, handler Handler) { DefaultServeMux.Handle(pattern, handler) }
+func Handle(method string, handler Handler) { DefaultServeMux.Handle(method, handler) }
 
-// HandleFunc registers the handler function for the given pattern
+// HandleFunc registers the handler function for the given method 
 // in the DefaultServeMux.
-// The documentation for ServeMux explains how patterns are matched.
-func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
-	DefaultServeMux.HandleFunc(pattern, handler)
+func HandleFunc(method string, handler func(ResponseWriter, *Request)) {
+	DefaultServeMux.HandleFunc(method, handler)
 }
 
-// Serve accepts incoming HTTP connections on the listener l,
+// Serve accepts incoming RTSP connections on the listener l,
 // creating a new service thread for each.  The service threads
 // read requests and then call handler to reply to them.
 // Handler is typically nil, in which case the DefaultServeMux is used.
@@ -994,14 +732,13 @@ func Serve(l net.Listener, handler Handler) error {
 	return srv.Serve(l)
 }
 
-// A Server defines parameters for running an HTTP server.
+// A Server defines parameters for running an RTSP server.
 type Server struct {
 	Addr           string        // TCP address to listen on, ":http" if empty
 	Handler        Handler       // handler to invoke, http.DefaultServeMux if nil
 	ReadTimeout    time.Duration // maximum duration before timing out read of the request
 	WriteTimeout   time.Duration // maximum duration before timing out write of the response
 	MaxHeaderBytes int           // maximum size of request headers, DefaultMaxHeaderBytes if 0
-	TLSConfig      *tls.Config   // optional TLS config, used by ListenAndServeTLS
 }
 
 // ListenAndServe listens on the TCP network address srv.Addr and then
@@ -1037,7 +774,7 @@ func (srv *Server) Serve(l net.Listener) error {
 				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
-				log.Printf("http: Accept error: %v; retrying in %v", e, tempDelay)
+				log.Printf("rtsp: Accept error: %v; retrying in %v", e, tempDelay)
 				time.Sleep(tempDelay)
 				continue
 			}
@@ -1070,18 +807,17 @@ func (srv *Server) Serve(l net.Listener) error {
 //
 //	import (
 //		"io"
-//		"net/http"
+//		"rtsp"
 //		"log"
 //	)
 //
-//	// hello world, the web server
-//	func HelloServer(w http.ResponseWriter, req *http.Request) {
-//		io.WriteString(w, "hello, world!\n")
+//	func OptionsHandler(w rtsp.ResponseWriter, req *rtsp.Request) {
+//		...
 //	}
 //
 //	func main() {
-//		http.HandleFunc("/hello", HelloServer)
-//		err := http.ListenAndServe(":12345", nil)
+//		http.HandleFunc("OPTIONS", OptionsHandler)
+//		err := rtsp.ListenAndServe(":12345", nil)
 //		if err != nil {
 //			log.Fatal("ListenAndServe: ", err)
 //		}
@@ -1091,80 +827,9 @@ func ListenAndServe(addr string, handler Handler) error {
 	return server.ListenAndServe()
 }
 
-// ListenAndServeTLS acts identically to ListenAndServe, except that it
-// expects HTTPS connections. Additionally, files containing a certificate and
-// matching private key for the server must be provided. If the certificate
-// is signed by a certificate authority, the certFile should be the concatenation
-// of the server's certificate followed by the CA's certificate.
-//
-// A trivial example server is:
-//
-//	import (
-//		"log"
-//		"net/http"
-//	)
-//
-//	func handler(w http.ResponseWriter, req *http.Request) {
-//		w.Header().Set("Content-Type", "text/plain")
-//		w.Write([]byte("This is an example server.\n"))
-//	}
-//
-//	func main() {
-//		http.HandleFunc("/", handler)
-//		log.Printf("About to listen on 10443. Go to https://127.0.0.1:10443/")
-//		err := http.ListenAndServeTLS(":10443", "cert.pem", "key.pem", nil)
-//		if err != nil {
-//			log.Fatal(err)
-//		}
-//	}
-//
-// One can use generate_cert.go in crypto/tls to generate cert.pem and key.pem.
-func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Handler) error {
-	server := &Server{Addr: addr, Handler: handler}
-	return server.ListenAndServeTLS(certFile, keyFile)
-}
-
-// ListenAndServeTLS listens on the TCP network address srv.Addr and
-// then calls Serve to handle requests on incoming TLS connections.
-//
-// Filenames containing a certificate and matching private key for
-// the server must be provided. If the certificate is signed by a
-// certificate authority, the certFile should be the concatenation
-// of the server's certificate followed by the CA's certificate.
-//
-// If srv.Addr is blank, ":https" is used.
-func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	addr := srv.Addr
-	if addr == "" {
-		addr = ":https"
-	}
-	config := &tls.Config{}
-	if srv.TLSConfig != nil {
-		*config = *srv.TLSConfig
-	}
-	if config.NextProtos == nil {
-		config.NextProtos = []string{"http/1.1"}
-	}
-
-	var err error
-	config.Certificates = make([]tls.Certificate, 1)
-	config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return err
-	}
-
-	conn, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	tlsListener := tls.NewListener(conn, config)
-	return srv.Serve(tlsListener)
-}
-
 // TimeoutHandler returns a Handler that runs h with the given time limit.
 //
-// The new Handler calls h.ServeHTTP to handle each request, but if a
+// The new Handler calls h.ServeRTSP to handle each request, but if a
 // call runs for more than ns nanoseconds, the handler responds with
 // a 503 Service Unavailable error and the given message in its body.
 // (If msg is empty, a suitable default message will be sent.)
@@ -1179,7 +844,7 @@ func TimeoutHandler(h Handler, dt time.Duration, msg string) Handler {
 
 // ErrHandlerTimeout is returned on ResponseWriter Write calls
 // in handlers which have timed out.
-var ErrHandlerTimeout = errors.New("http: Handler timeout")
+var ErrHandlerTimeout = errors.New("rtsp: Handler timeout")
 
 type timeoutHandler struct {
 	handler Handler
@@ -1187,14 +852,7 @@ type timeoutHandler struct {
 	body    string
 }
 
-func (h *timeoutHandler) errorBody() string {
-	if h.body != "" {
-		return h.body
-	}
-	return "<html><head><title>Timeout</title></head><body><h1>Timeout</h1></body></html>"
-}
-
-func (h *timeoutHandler) ServeHTTP(w ResponseWriter, r *Request) {
+func (h *timeoutHandler) ServeRTSP(w ResponseWriter, r *Request) {
 	done := make(chan bool)
 	tw := &timeoutWriter{w: w}
 	go func() {
@@ -1209,7 +867,6 @@ func (h *timeoutHandler) ServeHTTP(w ResponseWriter, r *Request) {
 		defer tw.mu.Unlock()
 		if !tw.wroteHeader {
 			tw.w.WriteHeader(StatusServiceUnavailable)
-			tw.w.Write([]byte(h.errorBody()))
 		}
 		tw.timedOut = true
 	}

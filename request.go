@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// HTTP Request reading and parsing.
+// RTSP Request reading and parsing.
 
-package http
+package rtsp
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -33,7 +32,7 @@ const (
 // is either not present in the request or not a file field.
 var ErrMissingFile = errors.New("http: no such file")
 
-// HTTP request parsing errors.
+// RTSP request parsing errors.
 type ProtocolError struct {
 	ErrorString string
 }
@@ -66,15 +65,15 @@ var reqWriteExcludeHeader = map[string]bool{
 	"Trailer":           true,
 }
 
-// A Request represents an HTTP request received by a server
+// A Request represents an RTSP request received by a server
 // or to be sent by a client.
 type Request struct {
-	Method string // GET, POST, PUT, etc.
+	Method string // DESCRIBE, SETUP, PLAY, etc.
 	URL    *url.URL
 
 	// The protocol version for incoming requests.
-	// Outgoing requests always use HTTP/1.1.
-	Proto      string // "HTTP/1.0"
+	// Outgoing requests always use RTSP/1.0.
+	Proto      string // "RTSP/1.0"
 	ProtoMajor int    // 1
 	ProtoMinor int    // 0
 
@@ -93,7 +92,7 @@ type Request struct {
 	//		"Connection": {"keep-alive"},
 	//	}
 	//
-	// HTTP defines that header names are case-insensitive.
+	// RTSP defines that header names are case-insensitive.
 	// The request parser implements this by canonicalizing the
 	// name, making the first character and any characters
 	// following a hyphen uppercase and the rest lowercase.
@@ -125,51 +124,26 @@ type Request struct {
 	// or the host name given in the URL itself.
 	Host string
 
-	// Form contains the parsed form data, including both the URL
-	// field's query parameters and the POST or PUT form data.
-	// This field is only available after ParseForm is called.
-	// The HTTP client ignores Form and uses Body instead.
+	// Form contains the parsed form data, including the URL
+	// field's query parameters 
 	Form url.Values
 
-	// MultipartForm is the parsed multipart form, including file uploads.
-	// This field is only available after ParseMultipartForm is called.
-	// The HTTP client ignores MultipartForm and uses Body instead.
-	MultipartForm *multipart.Form
-
-	// Trailer maps trailer keys to values.  Like for Header, if the
-	// response has multiple trailer lines with the same key, they will be
-	// concatenated, delimited by commas.
-	// For server requests, Trailer is only populated after Body has been
-	// closed or fully consumed.
-	// Trailer support is only partially complete.
-	Trailer Header
-
-	// RemoteAddr allows HTTP servers and other software to record
+	// RemoteAddr allows RTSP servers and other software to record
 	// the network address that sent the request, usually for
 	// logging. This field is not filled in by ReadRequest and
 	// has no defined format. The HTTP server in this package
 	// sets RemoteAddr to an "IP:port" address before invoking a
 	// handler.
-	// This field is ignored by the HTTP client.
 	RemoteAddr string
 
 	// RequestURI is the unmodified Request-URI of the
 	// Request-Line (RFC 2616, Section 5.1) as sent by the client
 	// to a server. Usually the URL field should be used instead.
-	// It is an error to set this field in an HTTP client request.
+	// It is an error to set this field in an RTSP client request.
 	RequestURI string
-
-	// TLS allows HTTP servers and other software to record
-	// information about the TLS connection on which the request
-	// was received. This field is not filled in by ReadRequest.
-	// The HTTP server in this package sets the field for
-	// TLS-enabled connections before invoking a handler;
-	// otherwise it leaves the field nil.
-	// This field is ignored by the HTTP client.
-	TLS *tls.ConnectionState
 }
 
-// ProtoAtLeast returns whether the HTTP protocol used
+// ProtoAtLeast returns whether the RTSP protocol used
 // in the request is at least major.minor.
 func (r *Request) ProtoAtLeast(major, minor int) bool {
 	return r.ProtoMajor > major ||
@@ -179,35 +153,6 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 // UserAgent returns the client's User-Agent, if sent in the request.
 func (r *Request) UserAgent() string {
 	return r.Header.Get("User-Agent")
-}
-
-// Cookies parses and returns the HTTP cookies sent with the request.
-func (r *Request) Cookies() []*Cookie {
-	return readCookies(r.Header, "")
-}
-
-var ErrNoCookie = errors.New("http: named cookie not present")
-
-// Cookie returns the named cookie provided in the request or
-// ErrNoCookie if not found.
-func (r *Request) Cookie(name string) (*Cookie, error) {
-	for _, c := range readCookies(r.Header, name) {
-		return c, nil
-	}
-	return nil, ErrNoCookie
-}
-
-// AddCookie adds a cookie to the request.  Per RFC 6265 section 5.4,
-// AddCookie does not attach more than one Cookie header field.  That
-// means all cookies, if any, are written into the same line,
-// separated by semicolon.
-func (r *Request) AddCookie(c *Cookie) {
-	s := fmt.Sprintf("%s=%s", sanitizeName(c.Name), sanitizeValue(c.Value))
-	if c := r.Header.Get("Cookie"); c != "" {
-		r.Header.Set("Cookie", c+"; "+s)
-	} else {
-		r.Header.Set("Cookie", s)
-	}
 }
 
 // Referer returns the referring URL, if sent in the request.
@@ -222,45 +167,6 @@ func (r *Request) Referer() string {
 	return r.Header.Get("Referer")
 }
 
-// multipartByReader is a sentinel value.
-// Its presence in Request.MultipartForm indicates that parsing of the request
-// body has been handed off to a MultipartReader instead of ParseMultipartFrom.
-var multipartByReader = &multipart.Form{
-	Value: make(map[string][]string),
-	File:  make(map[string][]*multipart.FileHeader),
-}
-
-// MultipartReader returns a MIME multipart reader if this is a
-// multipart/form-data POST request, else returns nil and an error.
-// Use this function instead of ParseMultipartForm to
-// process the request body as a stream.
-func (r *Request) MultipartReader() (*multipart.Reader, error) {
-	if r.MultipartForm == multipartByReader {
-		return nil, errors.New("http: MultipartReader called twice")
-	}
-	if r.MultipartForm != nil {
-		return nil, errors.New("http: multipart handled by ParseMultipartForm")
-	}
-	r.MultipartForm = multipartByReader
-	return r.multipartReader()
-}
-
-func (r *Request) multipartReader() (*multipart.Reader, error) {
-	v := r.Header.Get("Content-Type")
-	if v == "" {
-		return nil, ErrNotMultipart
-	}
-	d, params, err := mime.ParseMediaType(v)
-	if err != nil || d != "multipart/form-data" {
-		return nil, ErrNotMultipart
-	}
-	boundary, ok := params["boundary"]
-	if !ok {
-		return nil, ErrMissingBoundary
-	}
-	return multipart.NewReader(r.Body, boundary), nil
-}
-
 // Return value if nonempty, def otherwise.
 func valueOrDefault(value, def string) string {
 	if value != "" {
@@ -269,33 +175,15 @@ func valueOrDefault(value, def string) string {
 	return def
 }
 
-const defaultUserAgent = "Go http package"
+const defaultUserAgent = "Go rtsp package"
 
-// Write writes an HTTP/1.1 request -- header and body -- in wire format.
+// Write writes an RTSP/1.0 request -- header -- in wire format.
 // This method consults the following fields of the request:
-//	Host
 //	URL
-//	Method (defaults to "GET")
+//	Method (defaults to "SETUP")
 //	Header
-//	ContentLength
-//	TransferEncoding
-//	Body
-//
-// If Body is present, Content-Length is <= 0 and TransferEncoding
-// hasn't been set to "identity", Write adds "Transfer-Encoding:
-// chunked" to the header. Body is closed after it is sent.
 func (r *Request) Write(w io.Writer) error {
 	return r.write(w, false, nil)
-}
-
-// WriteProxy is like Write but writes the request in the form
-// expected by an HTTP proxy.  In particular, WriteProxy writes the
-// initial Request-URI line of the request with an absolute URI, per
-// section 5.1.2 of RFC 2616, including the scheme and host.
-// In either case, WriteProxy also writes a Host header, using
-// either r.Host or r.URL.Host.
-func (r *Request) WriteProxy(w io.Writer) error {
-	return r.write(w, true, nil)
 }
 
 // extraHeaders may be nil
@@ -387,10 +275,10 @@ func atoi(s string, i int) (n, i1 int, ok bool) {
 	return n, i, true
 }
 
-// ParseHTTPVersion parses a HTTP version string.
-// "HTTP/1.0" returns (1, 0, true).
+// ParseRTSPVersion parses a RTSP version string.
+// "RTSP/1.0" returns (1, 0, true).
 func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
-	if len(vers) < 5 || vers[0:5] != "HTTP/" {
+	if len(vers) < 5 || vers[0:5] != "RTSP/" {
 		return 0, 0, false
 	}
 	major, i, ok := atoi(vers, 5)
@@ -404,55 +292,13 @@ func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
 	return major, minor, true
 }
 
-// NewRequest returns a new Request given a method, URL, and optional body.
-func NewRequest(method, urlStr string, body io.Reader) (*Request, error) {
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return nil, err
-	}
-	rc, ok := body.(io.ReadCloser)
-	if !ok && body != nil {
-		rc = ioutil.NopCloser(body)
-	}
-	req := &Request{
-		Method:     method,
-		URL:        u,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     make(Header),
-		Body:       rc,
-		Host:       u.Host,
-	}
-	if body != nil {
-		switch v := body.(type) {
-		case *strings.Reader:
-			req.ContentLength = int64(v.Len())
-		case *bytes.Buffer:
-			req.ContentLength = int64(v.Len())
-		}
-	}
-
-	return req, nil
-}
-
-// SetBasicAuth sets the request's Authorization header to use HTTP
-// Basic Authentication with the provided username and password.
-//
-// With HTTP Basic Authentication the provided username and password
-// are not encrypted.
-func (r *Request) SetBasicAuth(username, password string) {
-	s := username + ":" + password
-	r.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(s)))
-}
-
 // ReadRequest reads and parses a request from b.
 func ReadRequest(b *bufio.Reader) (req *Request, err error) {
 
 	tp := textproto.NewReader(b)
 	req = new(Request)
 
-	// First line: GET /index.html HTTP/1.0
+	// First line: SETUP /index.html RTSP/1.0
 	var s string
 	if s, err = tp.ReadLine(); err != nil {
 		return nil, err
@@ -470,31 +316,12 @@ func ReadRequest(b *bufio.Reader) (req *Request, err error) {
 	req.Method, req.RequestURI, req.Proto = f[0], f[1], f[2]
 	rawurl := req.RequestURI
 	var ok bool
-	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
-		return nil, &badStringError{"malformed HTTP version", req.Proto}
-	}
-
-	// CONNECT requests are used two different ways, and neither uses a full URL:
-	// The standard use is to tunnel HTTPS through an HTTP proxy.
-	// It looks like "CONNECT www.google.com:443 HTTP/1.1", and the parameter is
-	// just the authority section of a URL. This information should go in req.URL.Host.
-	//
-	// The net/rpc package also uses CONNECT, but there the parameter is a path
-	// that starts with a slash. It can be parsed with the regular URL parser,
-	// and the path will end up in req.URL.Path, where it needs to be in order for
-	// RPC to work.
-	justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
-	if justAuthority {
-		rawurl = "http://" + rawurl
+	if req.ProtoMajor, req.ProtoMinor, ok = ParseRTSPVersion(req.Proto); !ok {
+		return nil, &badStringError{"malformed RTSP version", req.Proto}
 	}
 
 	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
 		return nil, err
-	}
-
-	if justAuthority {
-		// Strip the bogus "http://" back off.
-		req.URL.Scheme = ""
 	}
 
 	// Subsequent lines: Key: value.
@@ -504,18 +331,9 @@ func ReadRequest(b *bufio.Reader) (req *Request, err error) {
 	}
 	req.Header = Header(mimeHeader)
 
-	// RFC2616: Must treat
-	//	GET /index.html HTTP/1.1
-	//	Host: www.google.com
-	// and
-	//	GET http://www.google.com/index.html HTTP/1.1
-	//	Host: doesntmatter
-	// the same.  In the second case, any Host line is ignored.
+	// RFC2326: Must treat
+	//	SETUP rtsp://www.google.com/audio RTSP/1.0
 	req.Host = req.URL.Host
-	if req.Host == "" {
-		req.Host = req.Header.Get("Host")
-	}
-	req.Header.Del("Host")
 
 	fixPragmaCacheControl(req.Header)
 
